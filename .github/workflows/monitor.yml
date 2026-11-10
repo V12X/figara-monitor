@@ -3,7 +3,12 @@ name: Monitor Figara
 on:
   schedule:
     - cron: '*/5 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      simular_queda:
+        description: 'Teste: finge que o site caiu (abre e depois fecha o aviso)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # só para o "sinal de vida" mensal (impede o GitHub de desligar o agendamento)
@@ -37,7 +42,8 @@ jobs:
             done
             problems="${problems}- $1: HTTP ${code:-sem resposta} (${2})"$'\n'
           }
-          try "Site figaracare.com" "https://figaracare.com/"
+          SITE="https://figaracare.com/"; [ "${{ inputs.simular_queda }}" = "true" ] && SITE="https://figaracare.com/pagina-de-teste-inexistente"
+          try "Site figaracare.com" "$SITE"
           try "Cápsula (aplicativo, banco e servidor do Enzo)" "https://capsula.figaracare.com/health/deep" '"status":"ok"'
           # certificado: avisa com 14 dias de antecedência
           for h in figaracare.com capsula.figaracare.com; do
