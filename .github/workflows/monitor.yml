@@ -2,18 +2,23 @@ name: Monitor Figara
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/30 * * * *'   # só reinicia o ciclo se ele tiver parado; o GitHub atrasa agendamentos por horas
   workflow_dispatch:
     inputs:
       simular_queda:
         description: 'Teste: finge que o site caiu (abre e depois fecha o aviso)'
         type: boolean
         default: false
+      segundos:
+        description: 'Duração do ciclo em segundos (padrão 20700 = 5h45)'
+        default: '20700'
 
 permissions:
-  contents: write   # só para o "sinal de vida" mensal (impede o GitHub de desligar o agendamento)
+  contents: write   # sinal de vida mensal (impede o GitHub de desligar o agendamento)
   issues: write     # abre/fecha o aviso de queda
+  actions: write    # inicia o próximo ciclo
 
+# Um ciclo por vez; o seguinte espera na fila (só 1 fica pendente).
 concurrency:
   group: monitor
   cancel-in-progress: false
@@ -21,68 +26,23 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 355
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Conferir site, Cápsula, servidor do Enzo e certificados
-        id: check
-        run: |
-          problems=""
-          # 3 tentativas com pausa: um soluço de rede não vira alarme
-          try() { # nome url [texto esperado]
-            for i in 1 2 3; do
-              out=$(curl -s -m 15 -A "figara-monitor/1.0" -w "\n%{http_code}" "$2" || true)
-              code=$(printf "%s" "$out" | tail -n1); body=$(printf "%s" "$out" | sed '$d')
-              if [ "$code" = "200" ] && { [ -z "$3" ] || printf "%s" "$body" | grep -q "$3"; }; then return 0; fi
-              sleep 20
-            done
-            problems="${problems}- $1: HTTP ${code:-sem resposta} (${2})"$'\n'
-          }
-          SITE="https://figaracare.com/"; [ "${{ inputs.simular_queda }}" = "true" ] && SITE="https://figaracare.com/pagina-de-teste-inexistente"
-          try "Site figaracare.com" "$SITE"
-          try "Cápsula (aplicativo, banco e servidor do Enzo)" "https://capsula.figaracare.com/health/deep" '"status":"ok"'
-          # certificado: avisa com 14 dias de antecedência
-          for h in figaracare.com capsula.figaracare.com; do
-            end=$(echo | openssl s_client -servername $h -connect $h:443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
-            if [ -z "$end" ]; then problems="${problems}- Certificado de $h: não foi possível ler"$'\n'; continue; fi
-            days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
-            [ "$days" -lt 14 ] && problems="${problems}- Certificado de $h vence em $days dia(s)"$'\n'
-          done
-          if [ -n "$problems" ]; then
-            echo "FALHOU:"; printf "%s" "$problems"
-            { echo "ok=false"; echo "problems<<EOF"; printf "%s" "$problems"; echo "EOF"; } >> "$GITHUB_OUTPUT"
-          else
-            echo "tudo ok"; echo "ok=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Um aviso por queda (não um por checagem): abre uma issue; fecha sozinha quando voltar.
-      - name: Abrir aviso de queda
-        if: steps.check.outputs.ok == 'false'
+      - name: Conferir a cada minuto
         env:
-          PROBLEMS: ${{ steps.check.outputs.problems }}
+          SIMULAR: ${{ inputs.simular_queda }}
+          SEGUNDOS: ${{ inputs.segundos }}
         run: |
-          n=$(gh issue list --state open --label queda --json number --jq '.[0].number // empty')
-          body="Detectado em $(date -u '+%d/%m/%Y %H:%M') UTC:"$'\n\n'"$PROBLEMS"
-          if [ -z "$n" ]; then
-            gh label create queda --color B60205 --description "Serviço fora do ar" 2>/dev/null || true
-            gh issue create --title "FORA DO AR: Figara ($(date -u '+%d/%m %H:%M') UTC)" --label queda --body "$body"
-          else
-            echo "aviso já aberto (#$n)"
-          fi
+          [ "$SIMULAR" = "true" ] && export ALVO_SITE="https://figaracare.com/pagina-de-teste-inexistente"
+          [ -n "$SEGUNDOS" ] && export MONITOR_SEGUNDOS="$SEGUNDOS"
+          bash monitor.sh
 
-      - name: Fechar aviso quando voltar
-        if: steps.check.outputs.ok == 'true'
-        run: |
-          for n in $(gh issue list --state open --label queda --json number --jq '.[].number'); do
-            gh issue comment "$n" --body "Voltou ao normal em $(date -u '+%d/%m/%Y %H:%M') UTC."
-            gh issue close "$n"
-          done
-
-      # O GitHub desliga agendamentos de repositórios públicos sem nenhuma atividade por 60 dias.
+      # O GitHub desliga agendamentos de repositórios públicos sem atividade por 60 dias.
       - name: Sinal de vida (1 commit por mês)
         run: |
           last=$(git log -1 --format=%ct)
@@ -91,3 +51,8 @@ jobs:
             git config user.name "figara-monitor"; git config user.email "monitor@users.noreply.github.com"
             git add .keepalive && git commit -m "sinal de vida" && git push
           fi
+
+      # Encadeia: ao terminar o ciclo, inicia o próximo (a fila do 'concurrency' o segura até este acabar).
+      - name: Iniciar o próximo ciclo
+        if: success() || failure()
+        run: gh workflow run monitor.yml
